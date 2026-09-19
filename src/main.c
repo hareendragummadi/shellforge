@@ -1,17 +1,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 #include "token.h"
 #include "lexer.h"
 #include "parser.h"
 #include "expand.h"
+#include "builtin.h"
+#include "executor.h"
 
 int main(void) {
     token_list_t tokens;
     pipeline_t pipeline;
     char *line;
+    int should_exit = 0;
 
     printf("========================================\n");
     printf("    Shellforge\n");
@@ -39,15 +44,17 @@ int main(void) {
         if (parse(&tokens, &pipeline)) {
             expand_variables(&pipeline);
             pipeline_print(&pipeline);
-        }
 
-        if (strcmp(line, "exit") == 0) {
-            free(line);
-            printf("Exiting...\n");
-            break;
+            if (execute_pipeline(&pipeline) == 1) {
+                should_exit = 1;
+            }
         }
 
         free(line);
+
+        if (should_exit) {
+            break;
+        }
     }
 
     return 0;
