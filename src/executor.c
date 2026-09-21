@@ -1,4 +1,7 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -9,6 +12,51 @@
 #include "builtin.h"
 
 int last_exit_status = 0;
+
+/* ---------- SIGCHLD handler (zombie prevention) ---------- */
+
+static int handler_installed = 0;
+
+static void sigchld_handler(int sig) {
+    int saved_errno = errno;
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        /* reap finished background children */
+    }
+    errno = saved_errno;
+}
+
+void setup_background_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+    handler_installed = 1;
+}
+
+/* While the parent waits for a foreground child, SIGCHLD is blocked so the
+ * handler cannot steal that child's exit status. */
+static void block_sigchld(sigset_t *old) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &set, old);
+}
+
+static void restore_sigmask(const sigset_t *old) {
+    sigprocmask(SIG_SETMASK, old, NULL);
+}
+
+/* Background jobs must not read from the keyboard. */
+static void redirect_stdin_to_null(void) {
+    int null_fd = open("/dev/null", O_RDONLY);
+    if (null_fd >= 0) {
+        dup2(null_fd, STDIN_FILENO);
+        close(null_fd);
+    }
+}
 
 /* ---------- helpers ---------- */
 
@@ -73,16 +121,28 @@ int execute_command(command_t *cmd) {
         return run_builtin(cmd);
     }
 
+    if (!handler_installed) {
+        setup_background_handler();
+    }
+
+    sigset_t old_mask;
+    block_sigchld(&old_mask);
+
     fflush(stdout);
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("fork");
+        restore_sigmask(&old_mask);
         return -1;
     }
 
     if (pid == 0) {
         /* child */
+        restore_sigmask(&old_mask);
+        if (cmd->background) {
+            redirect_stdin_to_null();
+        }
         if (setup_redirection(cmd) != 0) {
             _exit(1);
         }
@@ -93,20 +153,22 @@ int execute_command(command_t *cmd) {
 
     /* parent */
     if (cmd->background) {
-        printf("[background] pid %d\n", pid);
+        printf("[Background PID: %d]\n", pid);
+        restore_sigmask(&old_mask);
         return 0;
     }
 
     int status;
     waitpid(pid, &status, 0);
+    restore_sigmask(&old_mask);
     return status_of(status);
 }
 
 /* ---------- pipeline ---------- */
 
 int execute_pipeline(pipeline_t *pipeline) {
-    /* clean up finished background children */
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    if (!handler_installed) {
+        setup_background_handler();
     }
 
     if (pipeline == NULL || pipeline->command_count <= 0) {
@@ -144,6 +206,10 @@ int execute_pipeline(pipeline_t *pipeline) {
     int prev_read = -1;
     int pipefd[2];
 
+    int background = pipeline->commands[n - 1].background;
+    sigset_t old_mask;
+    block_sigchld(&old_mask);
+
     fflush(stdout);
 
     for (int i = 0; i < n; i++) {
@@ -168,6 +234,11 @@ int execute_pipeline(pipeline_t *pipeline) {
 
         if (pid == 0) {
             /* ---- child ---- */
+            restore_sigmask(&old_mask);
+
+            if (background && i == 0) {
+                redirect_stdin_to_null();
+            }
             if (prev_read != -1) {
                 dup2(prev_read, STDIN_FILENO);
                 close(prev_read);
@@ -213,8 +284,9 @@ int execute_pipeline(pipeline_t *pipeline) {
     }
 
     /* background pipeline: do not wait */
-    if (pipeline->commands[n - 1].background && forked == n) {
-        printf("[background] pid %d\n", pids[n - 1]);
+    if (background && forked == n) {
+        printf("[Background Pipeline PID: %d]\n", pids[0]);
+        restore_sigmask(&old_mask);
         last_exit_status = 0;
         return 0;
     }
@@ -229,6 +301,7 @@ int execute_pipeline(pipeline_t *pipeline) {
         }
     }
 
+    restore_sigmask(&old_mask);
     last_exit_status = last_status;
     return 0;
 }

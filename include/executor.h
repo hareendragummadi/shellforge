@@ -12,6 +12,10 @@ int execute_command(command_t *cmd);
  * The exit status of the last command is saved in last_exit_status. */
 int execute_pipeline(pipeline_t *pipeline);
 
+/* Installs the SIGCHLD handler that reaps finished background jobs.
+ * It is called automatically the first time a command is executed. */
+void setup_background_handler(void);
+
 extern int last_exit_status;
 
 #endif
